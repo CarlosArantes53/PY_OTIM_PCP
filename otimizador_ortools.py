@@ -3,6 +3,7 @@ from typing import List, Dict, Optional, Tuple
 import time
 from gerador_padroes import GeradorPadroes
 from models import Chapa, Item, Padrao, SolucaoOtimizacao
+
 class OtimizadorORTools:
     """
     Resolver usando OR-Tools Linear Optimizer
@@ -10,7 +11,7 @@ class OtimizadorORTools:
     Problema: Cutting Stock Problem (Bin Packing 1D)
     - Decisão: quantas vezes usar cada padrão?
     - Objetivo: minimizar chapas ou maximizar aproveitamento
-    - Restrições: atender demanda, max 3 SKUs por chapa, 
+    - Restrições: atender demanda exata, max 3 SKUs por chapa, 
                    aproveitamento > 95%
     """
     
@@ -26,8 +27,8 @@ class OtimizadorORTools:
         Otimiza plano de corte gerando múltiplas soluções
         
         Args:
-            items_pedido: Items que devem ser produzidos (com quantidade)
-            items_estoque: Items disponíveis em estoque
+            items_pedido: Items que devem ser produzidos (quantidade exata)
+            items_estoque: Items disponíveis para preenchimento (opcionais, até o limite)
             max_solucoes: Quantas soluções (top) retornar
         
         Returns:
@@ -47,6 +48,23 @@ class OtimizadorORTools:
                 items_cobertos={}
             )]
         
+        # Define restrições de quantidade para cada código
+        restricoes = {}
+        
+        # Para PEDIDO: Quantidade deve ser EXATAMENTE a solicitada
+        for item in items_pedido:
+            restricoes[item.codigo] = {
+                'min': item.quantidade,
+                'max': item.quantidade
+            }
+            
+        # Para ESTOQUE: Quantidade entre 0 e o disponível (uso opcional)
+        for item in items_estoque:
+            restricoes[item.codigo] = {
+                'min': 0,
+                'max': item.quantidade
+            }
+        
         solucoes = []
         
         estrategias = [
@@ -58,8 +76,11 @@ class OtimizadorORTools:
         for estrategia_nome, peso_aproveitamento in estrategias[:max_solucoes]:
             self.solver.Clear()
             solucao = self._resolver_modelo(
-                padroes_validos, items_pedido, 
-                peso_aproveitamento, estrategia_nome
+                padroes_validos, 
+                restricoes,
+                peso_aproveitamento, 
+                estrategia_nome,
+                items_pedido
             )
             
             if solucao:
@@ -74,34 +95,35 @@ class OtimizadorORTools:
         return solucoes[:max_solucoes]
     
     def _resolver_modelo(self, padroes: List[Padrao], 
-                        items_pedido: List[Item],
+                        restricoes: Dict[str, Dict[str, int]],
                         peso_aproveitamento: float,
-                        estrategia: str) -> Optional[SolucaoOtimizacao]:
+                        estrategia: str,
+                        items_pedido_ref: List[Item]) -> Optional[SolucaoOtimizacao]:
+        
+        # Variáveis: quantas vezes usar cada padrão
         x = {}
         for i, padrao in enumerate(padroes):
             x[i] = self.solver.IntVar(0, 1000, f'padrao_{i}')
         
-        demanda_por_codigo = {item.codigo: item.quantidade 
-                              for item in items_pedido}
-        
-        for codigo, quantidade_demandada in demanda_por_codigo.items():
+        # Aplica restrições para todos os itens (Pedido e Estoque)
+        for codigo, limites in restricoes.items():
             constraint = self.solver.Constraint(
-                quantidade_demandada, 
-                self.solver.infinity(), 
-                f'demanda_{codigo}'
+                float(limites['min']), 
+                float(limites['max']), 
+                f'restricao_{codigo}'
             )
             
             for i, padrao in enumerate(padroes):
-                idx_item = next(
-                    (j for j, item in enumerate(padrao.items) 
-                     if item.codigo == codigo), 
-                    None
+                # Soma a quantidade deste item presente no padrão atual
+                qtd_no_padrao = sum(
+                    qtd for item, qtd in zip(padrao.items, padrao.quantidades)
+                    if item.codigo == codigo
                 )
                 
-                if idx_item is not None:
-                    qtd_item_padrao = padrao.quantidades[idx_item]
-                    constraint.SetCoefficient(x[i], qtd_item_padrao)
+                if qtd_no_padrao > 0:
+                    constraint.SetCoefficient(x[i], qtd_no_padrao)
         
+        # Função Objetivo
         objetivo = self.solver.Objective()
         
         if estrategia == "minimizar_chapas":
@@ -116,7 +138,7 @@ class OtimizadorORTools:
         
         status = self.solver.Solve()
         
-        if status != pywraplp.Solver.OPTIMAL:
+        if status not in [pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE]:
             return None
         
         padroes_usados = []
@@ -125,7 +147,7 @@ class OtimizadorORTools:
                 qtd_uso = int(round(x[i].solution_value()))
                 padroes_usados.append((padroes[i], qtd_uso))
         
-        solucao = self._montar_solucao(padroes_usados, items_pedido)
+        solucao = self._montar_solucao(padroes_usados, items_pedido_ref)
         return solucao
     
     def _montar_solucao(self, padroes_usados: List[Tuple[Padrao, int]],
